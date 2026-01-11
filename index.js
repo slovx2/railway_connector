@@ -118,11 +118,13 @@ async function generateConfig() {
   const config = {
     log: { access: '/dev/null', error: '/dev/null', loglevel: 'none' },
     inbounds: [
-      { port: ARGO_PORT, protocol: 'vless', settings: { clients: [{ id: UUID, flow: 'xtls-rprx-vision' }], decryption: 'none', fallbacks: [{ dest: 3001 }, { path: "/vless-argo", dest: 3002 }, { path: "/vmess-argo", dest: 3003 }, { path: "/trojan-argo", dest: 3004 }] }, streamSettings: { network: 'tcp' } },
-      { port: 3001, listen: "127.0.0.1", protocol: "vless", settings: { clients: [{ id: UUID }], decryption: "none" }, streamSettings: { network: "tcp", security: "none" } },
-      { port: 3002, listen: "127.0.0.1", protocol: "vless", settings: { clients: [{ id: UUID, level: 0 }], decryption: "none" }, streamSettings: { network: "ws", security: "none", wsSettings: { path: "/vless-argo" } }, sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false } },
-      { port: 3003, listen: "127.0.0.1", protocol: "vmess", settings: { clients: [{ id: UUID, alterId: 0 }] }, streamSettings: { network: "ws", wsSettings: { path: "/vmess-argo" } }, sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false } },
-      { port: 3004, listen: "127.0.0.1", protocol: "trojan", settings: { clients: [{ password: UUID }] }, streamSettings: { network: "ws", security: "none", wsSettings: { path: "/trojan-argo" } }, sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false } },
+      {
+        port: ARGO_PORT,
+        protocol: 'vless',
+        settings: { clients: [{ id: UUID }], decryption: 'none' },
+        streamSettings: { network: 'ws', wsSettings: { path: '/vless-argo' } },
+        sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false }
+      },
     ],
     dns: { servers: ["https+local://8.8.8.8/dns-query"] },
     outbounds: [ { protocol: "freedom", tag: "direct" }, {protocol: "blackhole", tag: "block"} ]
@@ -137,6 +139,30 @@ function getSystemArchitecture() {
     return 'arm';
   } else {
     return 'amd';
+  }
+}
+
+// 从 GitHub 下载官方 xray
+async function downloadXrayFromGitHub(destPath) {
+  const architecture = getSystemArchitecture();
+  const version = 'v24.11.21';
+  const zipName = architecture === 'arm' ? 'Xray-linux-arm64-v8a.zip' : 'Xray-linux-64.zip';
+  const downloadUrl = `https://github.com/XTLS/Xray-core/releases/download/${version}/${zipName}`;
+  const zipPath = path.join(FILE_PATH, 'xray.zip');
+
+  console.log(`Downloading xray from GitHub: ${zipName}`);
+  try {
+    execSync(`curl -sL "${downloadUrl}" -o "${zipPath}"`, { timeout: 120000 });
+    execSync(`unzip -o "${zipPath}" xray -d "${FILE_PATH}"`, { timeout: 30000 });
+    const extractedPath = path.join(FILE_PATH, 'xray');
+    if (fs.existsSync(extractedPath)) {
+      fs.renameSync(extractedPath, destPath);
+    }
+    fs.unlinkSync(zipPath);
+    console.log(`Download xray successfully`);
+  } catch (error) {
+    console.error(`Download xray failed: ${error.message}`);
+    throw error;
   }
 }
 
@@ -180,9 +206,13 @@ function downloadFile(fileName, fileUrl, callback) {
 }
 
 // 下载并运行依赖文件
-async function downloadFilesAndRun() {  
-  
+async function downloadFilesAndRun() {
   const architecture = getSystemArchitecture();
+
+  // 从 GitHub 下载 xray
+  await downloadXrayFromGitHub(webPath);
+
+  // 下载其他文件（cloudflared、nezha）
   const filesToDownload = getFilesForArchitecture(architecture);
 
   if (filesToDownload.length === 0) {
@@ -318,38 +348,18 @@ uuid: ${UUID}`;
 
 }
 
-//根据系统架构返回对应的url
+//根据系统架构返回对应的url（cloudflared 和 nezha）
 function getFilesForArchitecture(architecture) {
-  let baseFiles;
-  if (architecture === 'arm') {
-    baseFiles = [
-      { fileName: webPath, fileUrl: "https://arm64.ssss.nyc.mn/web" },
-      { fileName: botPath, fileUrl: "https://arm64.ssss.nyc.mn/bot" }
-    ];
-  } else {
-    baseFiles = [
-      { fileName: webPath, fileUrl: "https://amd64.ssss.nyc.mn/web" },
-      { fileName: botPath, fileUrl: "https://amd64.ssss.nyc.mn/bot" }
-    ];
-  }
+  const baseUrl = architecture === 'arm' ? "https://arm64.ssss.nyc.mn" : "https://amd64.ssss.nyc.mn";
+  let baseFiles = [
+    { fileName: botPath, fileUrl: `${baseUrl}/bot` }
+  ];
 
   if (NEZHA_SERVER && NEZHA_KEY) {
     if (NEZHA_PORT) {
-      const npmUrl = architecture === 'arm' 
-        ? "https://arm64.ssss.nyc.mn/agent"
-        : "https://amd64.ssss.nyc.mn/agent";
-        baseFiles.unshift({ 
-          fileName: npmPath, 
-          fileUrl: npmUrl 
-        });
+      baseFiles.unshift({ fileName: npmPath, fileUrl: `${baseUrl}/agent` });
     } else {
-      const phpUrl = architecture === 'arm' 
-        ? "https://arm64.ssss.nyc.mn/v1" 
-        : "https://amd64.ssss.nyc.mn/v1";
-      baseFiles.unshift({ 
-        fileName: phpPath, 
-        fileUrl: phpUrl
-      });
+      baseFiles.unshift({ fileName: phpPath, fileUrl: `${baseUrl}/v1` });
     }
   }
 
@@ -466,14 +476,7 @@ async function generateLinks(argoDomain) {
   const nodeName = NAME ? `${NAME}-${ISP}` : ISP;
   return new Promise((resolve) => {
     setTimeout(() => {
-      const VMESS = { v: '2', ps: `${nodeName}`, add: CFIP, port: CFPORT, id: UUID, aid: '0', scy: 'none', net: 'ws', type: 'none', host: argoDomain, path: '/vmess-argo?ed=2560', tls: 'tls', sni: argoDomain, alpn: '', fp: 'firefox'};
-      const subTxt = `
-vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${nodeName}
-
-vmess://${Buffer.from(JSON.stringify(VMESS)).toString('base64')}
-
-trojan://${UUID}@${CFIP}:${CFPORT}?security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${nodeName}
-    `;
+      const subTxt = `vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Fvless-argo#${nodeName}`;
       // 打印 sub.txt 内容到控制台
       console.log(Buffer.from(subTxt).toString('base64'));
       fs.writeFileSync(subPath, Buffer.from(subTxt).toString('base64'));
